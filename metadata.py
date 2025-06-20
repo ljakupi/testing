@@ -3,24 +3,97 @@ import yaml
 import json
 import requests
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List, Union
-from dataclasses import dataclass, field
-from functools import lru_cache
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
 from pathlib import Path
 import logging
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
 
+class Environment(Enum):
+    """Supported environments"""
+    DEV = "dev"
+    UAT = "uat"
+    PROD = "prod"
+
+
 @dataclass
 class MetadataConfig:
-    """Configuration for metadata sources"""
-    yaml_path: Optional[str] = None
-    api_base_url: Optional[str] = None
-    api_auth_token: Optional[str] = None
+    """Environment-specific configuration loaded from JSON file"""
+    name: str
+    api_base_url: str
     api_timeout: int = 30
-    cache_ttl: int = 300  # Cache TTL in seconds
-    env_prefix: str = "DATAOFFLOAD_"  # Prefix for environment variables
+    yaml_path: Optional[str] = None
+    api_auth_token_env_key: str = "API_TOKEN"  # Environment variable key for API token
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MetadataConfig':
+        """Create MetadataConfig from dictionary"""
+        return cls(
+            name=data.get('name', ''),
+            api_base_url=data.get('api_base_url', ''),
+            api_timeout=data.get('api_timeout', 30),
+            yaml_path=data.get('yaml_path'),
+            api_auth_token_env_key=data.get('api_auth_token_env_key', 'API_TOKEN')
+        )
+
+
+class EnvironmentResolver:
+    """Resolves environment configuration based on DSF_DOMAIN"""
+    
+    # Mapping of DSF_DOMAIN values to environment names
+    DOMAIN_MAPPING = {
+        'D': Environment.DEV,
+        'U': Environment.UAT,
+        'P': Environment.PROD
+    }
+    
+    def __init__(self, config_path: str = "config/environments.json"):
+        self.config_path = config_path
+        self._configs: Dict[Environment, MetadataConfig] = {}
+        self._load_configs()
+    
+    def _load_configs(self) -> None:
+        """Load all environment configurations from JSON file"""
+        config_file = Path(self.config_path)
+        if not config_file.exists():
+            logger.warning(f"Environment config file not found: {self.config_path}")
+            return
+        
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+                
+            for env_key, env_data in data.items():
+                if env_key in ['dev', 'uat', 'prod']:
+                    env = Environment(env_key)
+                    self._configs[env] = MetadataConfig.from_dict(env_data)
+                    
+        except Exception as e:
+            logger.error(f"Failed to load environment config: {e}")
+    
+    def get_environment(self, dsf_domain: str) -> Environment:
+        """Get environment enum based on DSF_DOMAIN value"""
+        if dsf_domain not in self.DOMAIN_MAPPING:
+            logger.warning(f"Unknown DSF_DOMAIN value: {dsf_domain}, defaulting to DEV")
+            return Environment.DEV
+        
+        return self.DOMAIN_MAPPING[dsf_domain]
+    
+    def get_config(self, dsf_domain: str) -> MetadataConfig:
+        """Get MetadataConfig for the given DSF_DOMAIN"""
+        env = self.get_environment(dsf_domain)
+        
+        if env not in self._configs:
+            # Return default config if not found
+            return MetadataConfig(
+                name=env.value,
+                api_base_url=f"https://metadata-api-{env.value}.azure.com"
+            )
+        
+        return self._configs[env]
 
 
 class MetadataSource(ABC):
@@ -47,28 +120,27 @@ class EnvironmentMetadataSource(MetadataSource):
     
     def __init__(self, prefix: str = ""):
         self.prefix = prefix
-        self._cache = {}
-        self.refresh()
     
     def fetch(self, key: str) -> Optional[Any]:
         """Fetch from environment with optional prefix"""
         env_key = f"{self.prefix}{key}" if self.prefix else key
-        return self._cache.get(env_key)
+        return os.environ.get(env_key)
     
     def fetch_all(self) -> Dict[str, Any]:
         """Return all environment variables with the prefix"""
-        return self._cache.copy()
-    
-    def refresh(self) -> None:
-        """Reload environment variables"""
-        self._cache = {}
+        result = {}
         for key, value in os.environ.items():
             if self.prefix and key.startswith(self.prefix):
                 # Remove prefix for cleaner access
                 clean_key = key[len(self.prefix):]
-                self._cache[clean_key] = value
+                result[clean_key] = value
             elif not self.prefix:
-                self._cache[key] = value
+                result[key] = value
+        return result
+    
+    def refresh(self) -> None:
+        """No-op for environment variables"""
+        pass
 
 
 class YamlMetadataSource(MetadataSource):
@@ -108,43 +180,24 @@ class YamlMetadataSource(MetadataSource):
 
 
 class ApiMetadataSource(MetadataSource):
-    """Metadata source for API endpoints"""
+    """Metadata source for API endpoints with support for nested JSON queries"""
     
     def __init__(self, base_url: str, auth_token: Optional[str] = None, 
                  timeout: int = 30):
         self.base_url = base_url.rstrip('/')
         self.auth_token = auth_token
         self.timeout = timeout
-        self._cache: Dict[str, Any] = {}
         self._headers = {}
+        self._api_data: Dict[str, Any] = {}
         
         if self.auth_token:
             self._headers['Authorization'] = f"Bearer {self.auth_token}"
-    
-    def fetch(self, key: str) -> Optional[Any]:
-        """Fetch metadata from API endpoint"""
-        if key in self._cache:
-            return self._cache[key]
         
-        try:
-            endpoint = f"{self.base_url}/metadata/{key}"
-            response = requests.get(
-                endpoint,
-                headers=self._headers,
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            self._cache[key] = data
-            return data
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch {key} from API: {e}")
-            return None
+        # Fetch all metadata on initialization
+        self._load_api_data()
     
-    def fetch_all(self) -> Dict[str, Any]:
-        """Fetch all metadata from API"""
+    def _load_api_data(self) -> None:
+        """Load all metadata from API endpoint"""
         try:
             endpoint = f"{self.base_url}/metadata"
             response = requests.get(
@@ -153,47 +206,156 @@ class ApiMetadataSource(MetadataSource):
                 timeout=self.timeout
             )
             response.raise_for_status()
-            
-            data = response.json()
-            self._cache.update(data)
-            return data
-            
+            self._api_data = response.json()
+            logger.info(f"Successfully loaded API metadata from {endpoint}")
         except Exception as e:
-            logger.error(f"Failed to fetch all metadata from API: {e}")
-            return self._cache.copy()
+            logger.error(f"Failed to load API metadata: {e}")
+            self._api_data = {}
+    
+    def _navigate_nested_dict(self, data: Dict[str, Any], keys: List[str]) -> Any:
+        """Navigate through nested dictionary using a list of keys"""
+        current = data
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return None
+        return current
+    
+    def _query_list(self, items: List[Dict[str, Any]], conditions: Dict[str, Any]) -> List[Any]:
+        """Query a list of dictionaries based on conditions"""
+        results = []
+        for item in items:
+            if all(item.get(k) == v for k, v in conditions.items()):
+                results.append(item)
+        return results
+    
+    def fetch(self, key: str) -> Optional[Any]:
+        """
+        Fetch metadata using various query patterns:
+        - Simple key: 'swci' -> returns value
+        - Nested key: 'resourceGroup' -> returns value
+        - Dot notation: 'servicePrinciples.0.name' -> returns specific item
+        - Query syntax: 'servicePrinciples[bookingCenter=001].name' -> returns filtered results
+        - List field extraction: 'storageContainers[bookingCenterCode=001].storageName' -> returns list of values
+        """
+        if not self._api_data:
+            return None
+        
+        # Handle query syntax: 'path[field=value].targetField'
+        if '[' in key and ']' in key:
+            return self._handle_query_syntax(key)
+        
+        # Handle dot notation for nested access
+        if '.' in key:
+            keys = key.split('.')
+            return self._navigate_nested_dict(self._api_data, keys)
+        
+        # Simple key access
+        return self._api_data.get(key)
+    
+    def _handle_query_syntax(self, query: str) -> Optional[Any]:
+        """
+        Handle query syntax like 'servicePrinciples[bookingCenter=001].name'
+        Returns single value, list of values, or list of objects based on query
+        """
+        import re
+        
+        # Parse the query pattern
+        match = re.match(r'([^[]+)\[([^]]+)\](?:\.(.+))?', query)
+        if not match:
+            return None
+        
+        list_path, conditions_str, target_field = match.groups()
+        
+        # Get the list to query
+        list_data = self._api_data.get(list_path)
+        if not isinstance(list_data, list):
+            return None
+        
+        # Parse conditions
+        conditions = {}
+        for condition in conditions_str.split(','):
+            if '=' in condition:
+                field, value = condition.strip().split('=', 1)
+                conditions[field.strip()] = value.strip()
+        
+        # Filter the list based on conditions
+        filtered_items = self._query_list(list_data, conditions)
+        
+        if not filtered_items:
+            return None
+        
+        # Extract target field if specified
+        if target_field:
+            results = []
+            for item in filtered_items:
+                value = self._navigate_nested_dict(item, target_field.split('.'))
+                if value is not None:
+                    results.append(value)
+            
+            # Return single value if only one result, otherwise return list
+            if len(results) == 1:
+                return results[0]
+            return results if results else None
+        
+        # Return the filtered objects if no target field specified
+        return filtered_items if len(filtered_items) > 1 else filtered_items[0]
+    
+    def fetch_all(self) -> Dict[str, Any]:
+        """Return all API metadata"""
+        return self._api_data.copy()
     
     def refresh(self) -> None:
-        """Clear cache to force fresh API calls"""
-        self._cache.clear()
+        """Reload metadata from API"""
+        self._load_api_data()
 
 
 class Metadata:
     """Main metadata manager that aggregates all sources"""
     
-    def __init__(self, config: Optional[MetadataConfig] = None):
-        self.config = config or MetadataConfig()
-        self._sources: Dict[str, MetadataSource] = {}
-        self._metadata_cache: Dict[str, Any] = {}
+    def __init__(self, environment_config_path: str = "config/environments.json"):
+        """
+        Initialize Metadata manager
         
-        # Initialize sources based on config
-        self._initialize_sources()
+        Args:
+            environment_config_path: Path to environment configuration JSON
+        """
+        self._sources: Dict[str, MetadataSource] = {}
+        
+        # Step 1: Initialize environment source first (no prefix)
+        self._sources['env'] = EnvironmentMetadataSource(prefix="")
+        
+        # Step 2: Get DSF_DOMAIN from the already loaded environment source
+        dsf_domain = self._sources['env'].fetch('DSF_DOMAIN')
+        if dsf_domain is None:
+            logger.warning("DSF_DOMAIN not found in environment, defaulting to 'D'")
+            dsf_domain = 'D'
+        self.dsf_domain = dsf_domain
+        
+        # Step 3: Load environment-specific configuration
+        resolver = EnvironmentResolver(environment_config_path)
+        self.config = resolver.get_config(dsf_domain)
+        
+        # Step 4: Initialize other sources based on loaded config
+        self._initialize_additional_sources()
     
-    def _initialize_sources(self) -> None:
-        """Initialize metadata sources based on configuration"""
-        # Always add environment source
-        self._sources['env'] = EnvironmentMetadataSource(
-            prefix=self.config.env_prefix
-        )
+    def _initialize_additional_sources(self) -> None:
+        """Initialize YAML and API sources based on MetadataConfig"""
         
         # Add YAML source if configured
-        if self.config.yaml_path and Path(self.config.yaml_path).exists():
-            self._sources['yaml'] = YamlMetadataSource(self.config.yaml_path)
+        yaml_path = self.config.yaml_path or "config/pipeline.yaml"
+        if Path(yaml_path).exists():
+            self._sources['yaml'] = YamlMetadataSource(yaml_path)
         
         # Add API source if configured
         if self.config.api_base_url:
+            # Get API token from environment using the configured key
+            api_token = self._sources['env'].fetch(self.config.api_auth_token_env_key)
+            
             self._sources['api'] = ApiMetadataSource(
                 base_url=self.config.api_base_url,
-                auth_token=self.config.api_auth_token,
+                auth_token=api_token,
                 timeout=self.config.api_timeout
             )
     
@@ -211,11 +373,6 @@ class Metadata:
         Returns:
             The metadata value or default
         """
-        # Check cache first
-        cache_key = f"{source}:{key}" if source else key
-        if cache_key in self._metadata_cache:
-            return self._metadata_cache[cache_key]
-        
         value = None
         
         if source:
@@ -230,29 +387,20 @@ class Metadata:
                     if value is not None:
                         break
         
-        # Cache the result
-        if value is not None:
-            self._metadata_cache[cache_key] = value
-            return value
-        
-        return default
+        return value if value is not None else default
     
     def get_required(self, key: str, source: Optional[str] = None) -> Any:
         """Get required metadata value, raise exception if not found"""
         value = self.get(key, source=source)
         if value is None:
-            raise ValueError(f"Required metadata key '{key}' not found")
+            source_msg = f" in source '{source}'" if source else ""
+            raise ValueError(f"Required metadata key '{key}' not found{source_msg}")
         return value
     
     def get_batch(self, keys: List[str], 
                   source: Optional[str] = None) -> Dict[str, Any]:
         """Fetch multiple keys at once"""
         return {key: self.get(key, source=source) for key in keys}
-    
-    def set(self, key: str, value: Any, source: str = 'env') -> None:
-        """Set metadata value in cache (doesn't persist to source)"""
-        cache_key = f"{source}:{key}"
-        self._metadata_cache[cache_key] = value
     
     def refresh(self, source: Optional[str] = None) -> None:
         """Refresh metadata from sources"""
@@ -262,9 +410,6 @@ class Metadata:
         else:
             for src in self._sources.values():
                 src.refresh()
-        
-        # Clear cache after refresh
-        self._metadata_cache.clear()
     
     def get_all(self, source: Optional[str] = None) -> Dict[str, Any]:
         """Get all metadata from a specific source or all sources"""
@@ -283,44 +428,50 @@ class Metadata:
     def sources(self) -> List[str]:
         """List available metadata sources"""
         return list(self._sources.keys())
+    
+    @property
+    def current_environment(self) -> str:
+        """Get current environment name"""
+        return self.config.name
 
 
 # Example usage
 if __name__ == "__main__":
-    # Configure metadata sources
-    config = MetadataConfig(
-        yaml_path="config/pipeline.yaml",
-        api_base_url="https://metadata-api.azure.com",
-        api_auth_token=os.environ.get("API_TOKEN"),
-        env_prefix="DATAOFFLOAD_"
-    )
+    # Set environment variables for testing
+    os.environ['DSF_DOMAIN'] = 'U'  # UAT environment
+    os.environ['API_TOKEN'] = 'secure-api-token-123'
+    os.environ['WAREHOUSE_HOST'] = 'warehouse.uat.company.com'
     
-    # Initialize metadata manager
-    metadata = Metadata(config)
+    # Initialize metadata - DSF_DOMAIN is read from environment source
+    metadata = Metadata(environment_config_path="config/environments.json")
     
-    # Get metadata from any source (searches all)
-    db_name = metadata.get("database_name")
+    print(f"Current environment: {metadata.current_environment}")
+    print(f"Config loaded:")
+    print(f"  - API URL: {metadata.config.api_base_url}")
+    print(f"  - API Timeout: {metadata.config.api_timeout}")
+    print(f"  - YAML Path: {metadata.config.yaml_path}")
     
-    # Get from specific source
-    api_key = metadata.get("api_key", source="env")
+    # Example API queries
+    # Simple key access
+    swci = metadata.get("swci", source="api")
+    print(f"\nSWCI: {swci}")
     
-    # Get required metadata (raises exception if not found)
-    pipeline_name = metadata.get_required("pipeline.name")
+    # Query with condition - get service principle name for booking center 001
+    sp_name = metadata.get("servicePrinciples[bookingCenter=001].name", source="api")
+    print(f"Service Principle Name: {sp_name}")
     
-    # Get multiple values at once
-    batch_data = metadata.get_batch([
-        "warehouse_host",
-        "warehouse_port",
-        "adls_container",
-        "databricks_workspace"
-    ])
+    # Query returning multiple values - get all storage names for booking center 001
+    storage_names = metadata.get("storageContainers[bookingCenterCode=001].storageName", source="api")
+    print(f"Storage Names: {storage_names}")
     
-    # Get all metadata from YAML source
-    yaml_metadata = metadata.get_all(source="yaml")
+    # Get entire filtered object
+    job = metadata.get("jobs[name=job1]", source="api")
+    print(f"Job: {job}")
     
-    # Refresh metadata from all sources
-    metadata.refresh()
+    # Regular metadata access
+    warehouse_host = metadata.get("WAREHOUSE_HOST", source="env")
+    pipeline_name = metadata.get("pipeline.name", source="yaml")
     
-    print(f"Database: {db_name}")
-    print(f"Pipeline: {pipeline_name}")
+    print(f"\nWarehouse Host: {warehouse_host}")
+    print(f"Pipeline Name: {pipeline_name}")
     print(f"Available sources: {metadata.sources}")
