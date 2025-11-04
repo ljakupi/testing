@@ -1,0 +1,39 @@
+# GitLab CI/CD configuration for deploying Docusaurus to GitLab Pages
+
+image: node:18
+
+# Cache node_modules for faster builds
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - node_modules/
+    - .npm/
+
+# Install dependencies before running jobs
+before_script:
+  - npm ci --cache .npm --prefer-offline
+
+# Deploy to GitLab Pages
+pages:
+  stage: deploy
+  script:
+    # Build the Docusaurus site
+    - npm run build
+    # GitLab Pages expects the static files to be in a directory called "public"
+    - mv build public
+  artifacts:
+    paths:
+      - public
+  # Only run on the main branch
+  only:
+    - main
+
+# Optional: Test build on all branches (not just main)
+test_build:
+  stage: test
+  script:
+    - npm run build
+  except:
+    - main
